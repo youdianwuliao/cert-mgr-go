@@ -489,23 +489,29 @@ func cmdRenew() {
 		return
 	}
 
-	// Renew all near-expiry certificates
+	// Renew all near-expiry certificates (deduplicate by cert file path)
 	renewed := 0
+	renewedFiles := map[string]bool{}
 	domains := sortedDomainKeys(state)
 
 	for _, domain := range domains {
 		entry := state.Certs[domain]
+		if renewedFiles[entry.Cert] {
+			continue // same cert file already renewed
+		}
+
 		info, err := LoadCertFromFile(entry.Cert)
 		if err != nil {
 			continue
 		}
 
-		// Skip if not near expiry (unless forced)
+		// Skip if not near expiry
 		if !info.Expired && info.DaysLeft > state.RenewDays {
 			continue
 		}
 
 		renewCertFile(state, domain, entry, info)
+		renewedFiles[entry.Cert] = true
 		renewed++
 	}
 
@@ -529,6 +535,31 @@ func cmdRenew() {
 
 func renewDomain(state State, domain string, force bool) {
 	entry, exists := state.Certs[domain]
+	if !exists {
+		// Search all known certs for one whose SANs include this domain
+		for d, e := range state.Certs {
+			// Load cert info if not cached
+			if e.Info == nil {
+				info, err := LoadCertFromFile(e.Cert)
+				if err == nil {
+					e.Info = info
+					state.Certs[d] = e
+				}
+			}
+			if e.Info != nil {
+				for _, san := range e.Info.DNSNames {
+					if san == domain {
+						entry = e
+						exists = true
+						break
+					}
+				}
+			}
+			if exists {
+				break
+			}
+		}
+	}
 	if !exists {
 		// Try to find in nginx config
 		if IsNginxInstalled() {
@@ -585,7 +616,20 @@ func renewDomain(state State, domain string, force bool) {
 }
 
 func renewCertFile(state State, domain string, entry CertEntry, oldInfo *CertInfo) {
-	fmt.Printf("🔄 %s (剩余 %d 天)...\n", domain, oldInfo.DaysLeft)
+	// Preserve all SANs from the original certificate
+	dnsNames := make([]string, len(oldInfo.DNSNames))
+	copy(dnsNames, oldInfo.DNSNames)
+	if len(dnsNames) == 0 {
+		dnsNames = []string{domain}
+	}
+
+	// Display (don't mutate dnsNames)
+	if len(dnsNames) > 3 {
+		fmt.Printf("🔄 %s (剩余 %d 天) SAN: %s... (%d个)\n", domain, oldInfo.DaysLeft,
+			strings.Join(dnsNames[:3], ", "), len(dnsNames))
+	} else {
+		fmt.Printf("🔄 %s (剩余 %d 天) SAN: %s\n", domain, oldInfo.DaysLeft, strings.Join(dnsNames, ", "))
+	}
 
 	// Generate new key
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -594,11 +638,16 @@ func renewCertFile(state State, domain string, entry CertEntry, oldInfo *CertInf
 		return
 	}
 
+	commonName := domain
+	if oldInfo.Subject != "" {
+		commonName = oldInfo.Subject
+	}
+
 	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	template := x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: domain},
-		DNSNames:     []string{domain},
+		Subject:      pkix.Name{CommonName: commonName},
+		DNSNames:     dnsNames,
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
@@ -634,8 +683,13 @@ func renewCertFile(state State, domain string, entry CertEntry, oldInfo *CertInf
 
 	newInfo, _ := LoadCertFromFile(entry.Cert)
 	entry.Info = newInfo
+
+	// Update all domains sharing this certificate
+	for _, d := range dnsNames {
+		state.Certs[d] = entry
+	}
 	state.Certs[domain] = entry
-	fmt.Printf("✅ %s 续期成功\n", domain)
+	fmt.Printf("✅ %s 续期成功（%d 个域名）\n", domain, len(dnsNames))
 }
 
 func sortedDomainKeys(state State) []string {
